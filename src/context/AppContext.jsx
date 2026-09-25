@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabaseClient";
 import { defaultProfile } from "../data/user";
 
@@ -14,10 +14,21 @@ function toE164(phone) {
   return `+91${digitsOf(phone)}`;
 }
 
+// Returns { patient } on success, { notPatient: true } when the query worked but this user has
+// no patients row (e.g. a doctor account's session), or { error } for a real failure (network
+// etc.) — the last is transient and never treated as "not a patient".
 async function fetchPatientProfile(userId) {
-  const { data, error } = await supabase.from("patients").select("*").eq("id", userId).single();
-  if (error) return null;
-  return data;
+  const { data, error } = await supabase.from("patients").select("*").eq("id", userId).maybeSingle();
+  if (error) return { error };
+  if (!data) return { notPatient: true };
+  return { patient: data };
+}
+
+// Same id-keyed merge as the doctor app's ClinicDataContext, used by both local writes and
+// Realtime events so a row arriving from both (this tab's own insert, then its Realtime echo)
+// is applied once. New rows go first, matching confirmBooking's existing newest-first behavior.
+function upsertById(rows, row) {
+  return rows.some((r) => r.id === row.id) ? rows.map((r) => (r.id === row.id ? row : r)) : [row, ...rows];
 }
 
 function initialsOf(name) {
@@ -46,9 +57,26 @@ function normalizeDoctor(row) {
 }
 
 export function AppProvider({ children }) {
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  // The session's user id is the single source of truth for being logged in (mirrors the doctor
+  // app's loggedInDoctorId) — a patients-row fetch failing never logs a valid session out.
+  const [sessionUserId, setSessionUserId] = useState(null);
   const [authReady, setAuthReady] = useState(false);
+  // signUp() fires SIGNED_IN before the matching patients row exists — while a signup is in
+  // flight, auth-change events are ignored (same as the doctor app's AuthContext).
+  const signupInProgressRef = useRef(false);
+
+  // profileStatus: 'idle' (logged out) | 'loading' | 'ready' | 'error'. Pages that need real
+  // profile fields check this instead of trusting `profile` blindly.
   const [profile, setProfile] = useState(defaultProfile);
+  const [profileStatus, setProfileStatus] = useState("idle");
+  const [profileReloadKey, setProfileReloadKey] = useState(0);
+  // Set when a session turned out to belong to a non-patient account; shown on the login screen.
+  const [notPatientNotice, setNotPatientNotice] = useState(false);
+
+  // A session only counts as logged in to this app if it isn't a known non-patient account.
+  // patientId gates every patient-data fetch and the Realtime channel below.
+  const isLoggedIn = sessionUserId != null && profileStatus !== "not_patient";
+  const patientId = isLoggedIn ? sessionUserId : null;
   const [appointments, setAppointments] = useState([]);
   const [appointmentsLoading, setAppointmentsLoading] = useState(true);
   const [appointmentsError, setAppointmentsError] = useState(null);
@@ -132,7 +160,7 @@ export function AppProvider({ children }) {
   // Own appointments only (RLS: auth.uid() = patient_id), so this only fetches once a real
   // session exists — same gating as doctors/workingHours above.
   useEffect(() => {
-    if (!isLoggedIn) {
+    if (!patientId) {
       setAppointments([]);
       setAppointmentsError(null);
       setAppointmentsLoading(false);
@@ -146,7 +174,7 @@ export function AppProvider({ children }) {
     supabase
       .from("appointments")
       .select("*")
-      .eq("patient_id", profile.id)
+      .eq("patient_id", patientId)
       .order("slot_time", { ascending: true })
       .then(({ data, error }) => {
         if (cancelled) return;
@@ -163,8 +191,46 @@ export function AppProvider({ children }) {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLoggedIn]);
+  }, [patientId]);
+
+  // Live updates: this patient's appointments changed from anywhere else (the doctor app, an
+  // admin, another tab) merge into local state without a full refetch — mirrors the doctor app's
+  // ClinicDataContext subscription. RLS (auth.uid() = patient_id) applies to Realtime too.
+  useEffect(() => {
+    if (!patientId) return;
+
+    const mergeIn = (row) => setAppointments((prev) => upsertById(prev, row));
+
+    // Unique topic per subscription: supabase.channel() hands back an existing channel with the
+    // same topic, which could be one still being torn down (StrictMode's double effect run, or a
+    // quick logout/login) — so this never reuses a stale channel.
+    const channel = supabase
+      .channel(`patient-appointments:${patientId}:${crypto.randomUUID()}`)
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "appointments", filter: `patient_id=eq.${patientId}` },
+        ({ new: appointment }) => mergeIn(appointment),
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "appointments", filter: `patient_id=eq.${patientId}` },
+        ({ new: appointment }) => mergeIn(appointment),
+      )
+      // DELETE events can't be filtered (Supabase limitation) and carry only the primary key —
+      // removing an id we never loaded is a no-op.
+      .on("postgres_changes", { event: "DELETE", schema: "public", table: "appointments" }, ({ old }) =>
+        setAppointments((prev) => prev.filter((a) => a.id !== old.id)),
+      )
+      .subscribe((status, err) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn(`[AppContext] Realtime subscription ${status}`, err);
+        }
+      });
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [patientId]);
 
   // Own medical history only (RLS: auth.uid() = patient_id) — read-only, patients never write
   // their own history, only doctors do.
@@ -173,7 +239,7 @@ export function AppProvider({ children }) {
   const [medicalHistoryError, setMedicalHistoryError] = useState(null);
 
   useEffect(() => {
-    if (!isLoggedIn) {
+    if (!patientId) {
       setMedicalHistory([]);
       setMedicalHistoryError(null);
       setMedicalHistoryLoading(false);
@@ -187,7 +253,7 @@ export function AppProvider({ children }) {
     supabase
       .from("medical_history")
       .select("*")
-      .eq("patient_id", profile.id)
+      .eq("patient_id", patientId)
       .then(({ data, error }) => {
         if (cancelled) return;
         if (error) {
@@ -203,8 +269,7 @@ export function AppProvider({ children }) {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLoggedIn]);
+  }, [patientId]);
 
   // medical_history has no doctor_id column of its own — appointment_id is the only real,
   // reliable link back to a specific doctor (most real rows have appointment_id: null, with the
@@ -224,34 +289,71 @@ export function AppProvider({ children }) {
   const getDoctorById = (id) => doctors.find((d) => d.id === id);
 
   // Restores a real session on load (e.g. a page refresh) instead of always starting logged
-  // out — a deliberate behavior change from the old mock login, which reset on every reload.
+  // out. Mirrors the doctor app's AuthContext: login state comes from the session alone, and
+  // onAuthStateChange keeps it in sync afterward (sign-in/out in another tab, token refresh —
+  // same user id, so a no-op — or expiry). Only sets state inside the listener: Supabase warns
+  // against awaiting other supabase calls there, since it runs while the auth client holds its
+  // internal lock. The patients row is fetched by the effect below instead.
   useEffect(() => {
-    let cancelled = false;
+    let active = true;
 
-    supabase.auth.getSession().then(async ({ data }) => {
-      const user = data?.session?.user;
-      if (user) {
-        const patient = await fetchPatientProfile(user.id);
-        if (!cancelled && patient) {
-          setProfile(patient);
-          setIsLoggedIn(true);
-        }
-      }
-      if (!cancelled) setAuthReady(true);
+    supabase.auth.getSession().then(({ data }) => {
+      if (!active) return;
+      const userId = data.session?.user.id ?? null;
+      setSessionUserId(userId);
+      // With a session, authReady waits for the patients-row check below instead, so a
+      // non-patient session never briefly renders a logged-in screen on reload.
+      if (!userId) setAuthReady(true);
     });
 
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!session) {
-        setIsLoggedIn(false);
-        setProfile(defaultProfile);
+      if (!active || signupInProgressRef.current) return;
+      setSessionUserId(session?.user.id ?? null);
+    });
+
+    return () => {
+      active = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  // (Re-)fetches the real patients row whenever a session appears or changes user. A failure
+  // leaves the user logged in with profileStatus 'error' — pages that need profile fields show
+  // a retry instead of stale or placeholder data. A session with no patients row at all (e.g. a
+  // doctor account left in this browser) is not a patient session: it's signed out locally only
+  // (scope 'local' — never ending that account's sessions elsewhere) and the login screen says why.
+  useEffect(() => {
+    if (!sessionUserId) {
+      setProfile(defaultProfile);
+      setProfileStatus("idle");
+      return;
+    }
+
+    let cancelled = false;
+    setProfileStatus("loading");
+
+    fetchPatientProfile(sessionUserId).then(({ patient, notPatient }) => {
+      if (cancelled) return;
+      if (patient) {
+        setProfile(patient);
+        setProfileStatus("ready");
+        setNotPatientNotice(false);
+      } else if (notPatient) {
+        setProfileStatus("not_patient");
+        setNotPatientNotice(true);
+        supabase.auth.signOut({ scope: "local" });
+      } else {
+        setProfileStatus("error");
       }
+      setAuthReady(true);
     });
 
     return () => {
       cancelled = true;
-      listener.subscription.unsubscribe();
     };
-  }, []);
+  }, [sessionUserId, profileReloadKey]);
+
+  const reloadProfile = () => setProfileReloadKey((k) => k + 1);
 
   // Read-only check used before showing the PIN step, so the login screen can decide whether
   // to ask for a PIN (account exists) or expand to signup (it doesn't) before any sign-in attempt.
@@ -283,9 +385,11 @@ export function AppProvider({ children }) {
     });
     if (error || !data?.session) return { ok: false, reason: "wrong_pin" };
 
-    const patient = await fetchPatientProfile(data.user.id);
-    setProfile(patient ?? defaultProfile);
-    setIsLoggedIn(true);
+    setNotPatientNotice(false);
+    // onAuthStateChange has already set this during signInWithPassword; setting the same id again
+    // is a no-op, and guarantees state is set before the caller navigates. The profile effect
+    // above fetches the patients row.
+    setSessionUserId(data.user.id);
     return { ok: true };
   };
 
@@ -296,6 +400,15 @@ export function AppProvider({ children }) {
     const localPhone = digitsOf(phone);
     const formattedPhone = toE164(phone);
 
+    signupInProgressRef.current = true;
+    try {
+      return await completeSignup({ name, localPhone, formattedPhone, age, place, pin });
+    } finally {
+      signupInProgressRef.current = false;
+    }
+  };
+
+  const completeSignup = async ({ name, localPhone, formattedPhone, age, place, pin }) => {
     const { data, error } = await supabase.auth.signUp({
       phone: formattedPhone,
       password: pin,
@@ -331,15 +444,16 @@ export function AppProvider({ children }) {
       return { ok: false, error: partialFailureMessage };
     }
 
-    setProfile(patientRow);
-    setIsLoggedIn(true);
+    setSessionUserId(data.user.id);
     return { ok: true };
   };
 
-  const logout = async () => {
-    await supabase.auth.signOut();
-    setIsLoggedIn(false);
-    setProfile(defaultProfile);
+  // Clears local state immediately (callers navigate to / right after — the "/" guard must
+  // already see isLoggedIn false, or it would bounce straight back to /home), rather than
+  // waiting for signOut's SIGNED_OUT event, which then sets the same null again (a no-op).
+  const logout = () => {
+    supabase.auth.signOut();
+    setSessionUserId(null);
   };
 
   // Real update. `phone` is never sent — the UI never offers to edit it, and patients.phone has
@@ -351,7 +465,7 @@ export function AppProvider({ children }) {
     const { data, error } = await supabase
       .from("patients")
       .update({ name: name.trim(), age: Number(age), place: place.trim() })
-      .eq("id", profile.id)
+      .eq("id", patientId)
       .select()
       .single();
     if (error) {
@@ -375,7 +489,7 @@ export function AppProvider({ children }) {
     }
 
     const appointmentRow = {
-      patient_id: profile.id,
+      patient_id: patientId,
       doctor_id: doctorId,
       slot_time: slotTimeDate.toISOString(),
       type: "online",
@@ -419,7 +533,9 @@ export function AppProvider({ children }) {
         "Your appointment is booked, but we couldn't save the payment record. Please contact the clinic if this isn't resolved before your visit.";
     }
 
-    setAppointments((prev) => [appointment, ...prev]);
+    // upsertById, not a plain prepend: this tab's own Realtime INSERT event for the same row can
+    // arrive before this insert's response does, and must not leave a duplicate behind.
+    setAppointments((prev) => upsertById(prev, appointment));
     setLastConfirmed({ appointment, doctor, payment, paymentWarning });
     return { ok: true, appointment };
   };
@@ -441,7 +557,7 @@ export function AppProvider({ children }) {
     if (error) {
       return { ok: false, error: error.message || "Couldn't cancel this appointment. Please try again." };
     }
-    setAppointments((prev) => prev.map((a) => (a.id === id ? data : a)));
+    setAppointments((prev) => upsertById(prev, data));
 
     let paymentWarning = null;
     try {
@@ -470,11 +586,14 @@ export function AppProvider({ children }) {
   const value = {
     isLoggedIn,
     authReady,
+    notPatientNotice,
     checkPhoneExists,
     login,
     signup,
     logout,
     profile,
+    profileStatus,
+    reloadProfile,
     updateProfile,
     doctors,
     doctorsLoading,

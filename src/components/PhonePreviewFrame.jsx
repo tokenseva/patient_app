@@ -47,6 +47,10 @@ function fitFrameSize(viewportWidth, viewportHeight) {
 
 export default function PhonePreviewFrame() {
   const { width: vw, height: vh } = useViewportSize();
+  // Read once: the framed app keeps the top-level URL in sync as it navigates (PreviewUrlSync in
+  // App.jsx), so this is whatever page was open before a reload. Never updated afterward —
+  // changing an iframe's src would reload the app inside it.
+  const [initialSrc] = useState(() => window.location.pathname + window.location.search);
   const { width, height } = fitFrameSize(vw, vh);
 
   return (
@@ -79,7 +83,7 @@ export default function PhonePreviewFrame() {
               full-viewport, with no CSS changes needed anywhere else. */}
           <iframe
             title="TokenSeva mobile preview"
-            src="/"
+            src={initialSrc}
             style={{ width: "100%", height: "100%", border: "none", display: "block" }}
           />
         </div>

@@ -1,4 +1,5 @@
-import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { useEffect } from "react";
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AppProvider, useApp } from "./context/AppContext";
 import useIsMobileViewport from "./hooks/useIsMobileViewport";
 import PhonePreviewFrame from "./components/PhonePreviewFrame";
@@ -18,6 +19,30 @@ function RequireAuth({ children }) {
   return children;
 }
 
+// Mirrors the doctor app's LoginRoute: a restored session skips the login screen. AuthGate below
+// has already waited for authReady, so isLoggedIn is settled by the time this renders.
+function LoginRoute() {
+  const { isLoggedIn } = useApp();
+  if (isLoggedIn) return <Navigate to="/home" replace />;
+  return <LoginPage />;
+}
+
+// Only does anything inside PhonePreviewFrame's iframe: mirrors the iframe's current path onto
+// the top-level URL, so a desktop reload reopens the same page instead of always "/". A no-op
+// on a real phone (not framed), and harmless if the parent is ever cross-origin.
+function PreviewUrlSync() {
+  const { pathname, search } = useLocation();
+  useEffect(() => {
+    if (window.parent === window) return;
+    try {
+      window.parent.history.replaceState(null, "", pathname + search);
+    } catch {
+      // cross-origin parent — nothing to sync
+    }
+  }, [pathname, search]);
+  return null;
+}
+
 // Waits for the one-time session-restoration check (see AppContext) before rendering any
 // route, so a page refresh doesn't briefly bounce a real, still-logged-in user to /.
 function AuthGate() {
@@ -29,7 +54,7 @@ function AuthGate() {
 function AppRoutes() {
   return (
     <Routes>
-      <Route path="/" element={<LoginPage />} />
+      <Route path="/" element={<LoginRoute />} />
       <Route
         path="/home"
         element={
@@ -107,6 +132,7 @@ export default function App() {
   return (
     <AppProvider>
       <BrowserRouter>
+        <PreviewUrlSync />
         <div className="w-full mx-auto" style={{ maxWidth: 430 }}>
           <AuthGate />
         </div>

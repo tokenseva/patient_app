@@ -30,7 +30,71 @@ function NavRow({ icon: Icon, label, onClick }) {
   );
 }
 
+// The form below seeds its inputs from `profile` once, on mount — so it only mounts once the real
+// patients row has loaded (keyed by id, so a different account remounts it). A failed load keeps
+// the user logged in and offers a retry instead of showing placeholder or stale details.
 export default function ProfilePage() {
+  const { profile, profileStatus, reloadProfile, logout } = useApp();
+  const navigate = useNavigate();
+
+  if (profileStatus === "ready") return <ProfileForm key={profile.id} />;
+
+  const handleLogout = () => {
+    logout();
+    navigate("/");
+  };
+
+  return (
+    <Screen
+      bg="var(--color-surface)"
+      header={<ScreenHeader onBack={() => navigate("/home")} title="Account" showAccount={false} />}
+      bodyPadding="20px 20px 20px"
+    >
+      <div className="flex flex-col items-center text-center" style={{ gap: 12, paddingTop: 40 }}>
+        {profileStatus === "error" ? (
+          <>
+            <span className="text-sm leading-5" style={{ color: "var(--color-text-secondary)" }}>
+              Couldn't load your profile. You're still logged in.
+            </span>
+            <button
+              type="button"
+              onClick={reloadProfile}
+              className="flex items-center justify-center border-none cursor-pointer"
+              style={{ minHeight: 44, padding: "0 20px", borderRadius: 14, background: "var(--color-ink)", color: "#FFFFFF", fontSize: 14, fontWeight: 600 }}
+            >
+              Try again
+            </button>
+          </>
+        ) : (
+          <span className="text-sm leading-5" style={{ color: "var(--color-text-secondary)" }}>
+            Loading your profile…
+          </span>
+        )}
+      </div>
+
+      <div className="flex-none" style={{ paddingTop: 20 }}>
+        <button
+          type="button"
+          onClick={handleLogout}
+          className="w-full flex items-center justify-center cursor-pointer"
+          style={{
+            minHeight: 48,
+            borderRadius: 16,
+            background: "var(--color-surface-subtle)",
+            border: "1px solid var(--color-border)",
+            color: "var(--color-text-primary)",
+            fontSize: 14,
+            fontWeight: 600,
+          }}
+        >
+          Log out
+        </button>
+      </div>
+    </Screen>
+  );
+}
+
+function ProfileForm() {
   const { profile, updateProfile, logout } = useApp();
   const navigate = useNavigate();
 

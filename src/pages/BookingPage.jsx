@@ -54,7 +54,7 @@ export default function BookingPage() {
 }
 
 function BookingScreen({ doctorId }) {
-  const { getDoctorById, profile, confirmBooking, workingHours } = useApp();
+  const { getDoctorById, profile, profileStatus, confirmBooking, workingHours } = useApp();
   const navigate = useNavigate();
 
   const doctor = getDoctorById(doctorId);
@@ -207,7 +207,7 @@ function BookingScreen({ doctorId }) {
                   Booking for
                 </div>
                 <div className="mt-0.5 text-base font-semibold" style={{ letterSpacing: "-0.01em", color: "var(--color-text-primary)" }}>
-                  {profile.name}
+                  {profileStatus === "ready" ? profile.name : "You"}
                 </div>
               </div>
               <span

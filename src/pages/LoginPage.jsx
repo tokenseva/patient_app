@@ -9,7 +9,7 @@ import PinInput from "../components/PinInput";
 const PIN_LENGTH = 6;
 
 export default function LoginPage() {
-  const { login, signup, checkPhoneExists } = useApp();
+  const { login, signup, checkPhoneExists, notPatientNotice } = useApp();
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState(false);
   const [name, setName] = useState("");
@@ -224,6 +224,12 @@ export default function LoginPage() {
               )}
             </div>
           </Collapse>
+
+          {notPatientNotice && !formError && (
+            <span className="text-xs leading-4 pt-2" style={{ color: "var(--color-status-cancelled)" }}>
+              This account isn't a patient account. Log in with a patient phone number to continue.
+            </span>
+          )}
 
           {formError && (
             <span className="text-xs leading-4 pt-2" style={{ color: "var(--color-status-cancelled)" }}>
