@@ -30,6 +30,7 @@ function LoginRoute() {
 // Only does anything inside PhonePreviewFrame's iframe: mirrors the iframe's current path onto
 // the top-level URL, so a desktop reload reopens the same page instead of always "/". A no-op
 // on a real phone (not framed), and harmless if the parent is ever cross-origin.
+// Relies on vercel.json's SPA rewrite in production, so reloading a deep path doesn't 404.
 function PreviewUrlSync() {
   const { pathname, search } = useLocation();
   useEffect(() => {
